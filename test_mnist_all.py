@@ -172,22 +172,21 @@ elif model == 'GAN_W':
 for dt,_ in it.islice(train_loader, 0, 1, 1):
     pass
 
-N = 144
+N = 64
 if model == 'NF':
     gen_data, _ = NF.generate_data(N=N, base_dist=base_dist)
 elif model == 'VAE':
     gen_data, _ = mdl.generate_data(N=N)
 elif model in ['GAN', 'GAN_W']:
     gen_data, _ = generator.generate_data(N)
-gen_randoms = ut.collate_images(gen_data, N=N, ncols=12)
-
+gen_randoms = ut.collate_images(gen_data, N=N, ncols=8)
 
 N = 64
 sz = 800
 opts={'width':sz, 'height':sz}
 opts['title'] = 'Generated Images {}'.format(model)
-vis.heatmap(im_gen, opts=opts, win='generated {}'.format(model))
+vis.heatmap(gen_randoms, opts=opts, win='generated {}'.format(model))
 
-opts['title'] = 'Test Images {}'.format(model)
-vis.heatmap(im_test, opts=opts, win='test_images {}'.format(model))
+#opts['title'] = 'Test Images {}'.format(model)
+#vis.heatmap(im_test, opts=opts, win='test_images {}'.format(model))
 
