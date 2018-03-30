@@ -1,4 +1,4 @@
-# Code used for *Learning the base distribution in implicit generative models'*
+# Code used for *Learning the base distribution in implicit generative models*
 [paper](https://arxiv.org/abs/1803.04357v2)
 
 ## Requirements:
