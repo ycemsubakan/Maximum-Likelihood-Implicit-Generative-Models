@@ -20,21 +20,26 @@ import string
 import wavenet_things.audio_data as ad
 import librosa as lr
 
-vis = visdom.Visdom(port=5800, server='http://cem@nmf.cs.illinois.edu', env='cem_dev')
-assert vis.check_connection()
-
-# Parse command line arguments
 argparser = argparse.ArgumentParser()
 argparser.add_argument('--num_gpus', type=int, help='number of gpus', default=2)
+argparser.add_argument('--model', type=str, help='choose your model (NF/VAE/GAN/WGAN)', default='NF')
+argparser.add_argument('--use_vis', type=int, help='use visdom to visualize or not', default=1)
+argparser.add_argument('--vis_server', type=str, help='use visdom to visualize or not', default='')
+argparser.add_argument('--vis_port', type=int, help='visdom port', default=1)
+
 arguments = argparser.parse_args()
 
-arguments.cuda = torch.cuda.is_available()
-arguments.batch_size = 200
+if arguments.use_vis:
+    vis = visdom.Visdom(port=arguments.vis_port, server=arguments.vis_server, env='dev')
+    assert vis.check_connection()
+else:
+    vis = None
 
 np.random.seed(2)
 torch.manual_seed(9)
 arguments.cuda = torch.cuda.is_available()
 
+arguments.batch_size = 200
 arguments.data = 'real_violin' 
 
 train_loader, wf = ut.preprocess_audio_files(arguments, overlap=True)
