@@ -26,6 +26,10 @@ import math
 import sklearn.mixture as mix
 import string as st
 from hmmlearn import hmm
+import scipy as sp
+import pytorch_fid.fid_score as fid
+import gmms.gmm_learn as gmm
+import torchvision
 
 class Normalizing_Flow_utils(nn.Module):
     def __init__(self, c, useu=False, cuda=False):
@@ -711,9 +715,9 @@ class Normalizing_Flow_utils(nn.Module):
 
     def NF_trainer(self, train_loader, vis, EP=150, mode='NF_base', config_num=1, arguments=None):
     
-        lr = 1e-3
+        lr = 1e-2
         opt = torch.optim.Adam(self.parameters(), lr=lr)
-        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, threshold=1e-4, patience=100, factor=0.8)
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, threshold=1e-8, patience=100, factor=0.8)
 
         all_costs = torch.zeros(EP)
         nbatches = 100
@@ -728,7 +732,7 @@ class Normalizing_Flow_utils(nn.Module):
                     # logdens, _, inv_f = self.compute_density_normal(invf=self.inverse_forward, x=Variable(data.cuda()))
                     cost = ((inv_f[-1] - Variable(self.tocuda(data)))**2).mean()
                 elif mode == 'NF_ML':
-                    logdens, _, inv_f = NF.compute_density_normal(invf=NF.inverse_forward, x=Variable(data))
+                    logdens, _, inv_f = self.compute_density_normal(invf=self.inverse_forward, x=Variable(data))
                     cost = (torch.abs(inv_f[-1] - Variable(data))).sum()  - logdens.mean() 
                                     
                 cost.backward()
@@ -803,7 +807,7 @@ def adversarial_trainer_step(ep, data, generator, discriminator, opts, arguments
         tar = tar.cuda()
         
     if ep < 20 or ep % 500 == 0:
-        Diters = 5
+        Diters = 2
     else:
         Diters = 1
 
@@ -1108,9 +1112,10 @@ class netD(nn.Module):
 
         return output
 
-class netG(nn.Module):
+
+class netG_toy(nn.Module):
     def __init__(self, L2, Ks, M=28):
-        super(netG, self).__init__()
+        super(netG_toy, self).__init__()
         self.L2 = L2
         self.M = M
         self.Ks = Ks
@@ -1121,28 +1126,78 @@ class netG(nn.Module):
         nn.init.uniform(self.l1.weight, a=-c, b=c)
         nn.init.uniform(self.l1.bias, a=-c, b=c)
 
+        self.l2 = nn.Linear(self.Ks[1], self.L2, bias=True)
+        nn.init.uniform(self.l2.weight, a=-c, b=c)
+        nn.init.uniform(self.l2.bias, a=-c, b=c)
+
+    def forward(self, inp): 
+        inp = inp.view(-1, self.Ks[0])
+
+        h1 = F.tanh(self.l1(inp))
+        output = (self.l2(h1))
+
+        return output
+
+
+class netG(nn.Module):
+    def __init__(self, L2, Ks, M=28, out='sigmoid'):
+        super(netG, self).__init__()
+        self.L2 = L2
+        self.M = M
+        self.Ks = Ks
+        self.base_dist = 'iso_fixed_gauss'
+        self.out = out
+
+        self.l1 = nn.Linear(self.Ks[0], self.Ks[1], bias=True)
+        c = 0.1
+        nn.init.uniform(self.l1.weight, a=-c, b=c)
+        nn.init.uniform(self.l1.bias, a=-c, b=c)
 
         self.l2 = nn.Linear(self.Ks[1], self.L2, bias=True)
         nn.init.uniform(self.l2.weight, a=-c, b=c)
         nn.init.uniform(self.l2.bias, a=-c, b=c)
 
 
-
     def forward(self, inp): 
         inp = inp.view(-1, self.Ks[0])
 
         h1 = F.tanh(self.l1(inp))
-        output = F.sigmoid(self.l2(h1))
+        if self.out == 'sigmoid':
+            output = F.sigmoid(self.l2(h1))
+        else:
+            output = self.l2(h1)
 
         return output
     
+    
     def generate_data(self, N, base_dist='fixed_iso_gauss'):
-        seed = torch.randn(N, self.Ks[0]) 
-        if self is self.cuda(): 
-            seed = seed.cuda()
-        seed = Variable(seed)
-        gen_data = self.forward(seed)
-        return gen_data, seed
+
+        if base_dist == 'fixed_iso_gauss':
+            seed = torch.randn(N, self.Ks[0]) 
+            if next(self.parameters()).is_cuda:
+            #self is self.cuda(): 
+                seed = seed.cuda()
+            gen_data = self.forward(seed)
+            return gen_data, seed
+        elif base_dist == 'mog':
+            clsts = np.random.choice(range(self.Kmog), N, p=self.pis.data.cpu().numpy())
+            mus = self.mus[:, clsts]
+            randn = torch.randn(mus.size())
+            if next(self.parameters()).is_cuda:
+                randn = randn.cuda()
+
+            zs = mus + (self.sigs[:, clsts].sqrt())*randn
+            gen_data = self.decode(zs.t())
+            return gen_data, zs
+        elif base_dist == 'mog_skt':
+            seed = self.GMM.sample(N)[0]
+            seed = torch.from_numpy(seed).float()
+
+            if self.cuda:
+                seed = seed.cuda()
+            return self.forward(seed), seed
+        else:
+            raise ValueError('what base distribution?')
 
 
 class NF_changedim(Normalizing_Flow_utils):
@@ -1462,7 +1517,7 @@ class netG_LU(Normalizing_Flow_utils):
         return H
 
 class VAE(nn.Module):
-    def __init__(self, L1, L2, Ks, M):
+    def __init__(self, L1, L2, Ks, M, outlin='sigmoid'):
         super(VAE, self).__init__()
 
         self.L1 = L1
@@ -1470,6 +1525,7 @@ class VAE(nn.Module):
         self.Ks = Ks
         self.M = M
         self.base_dist = 'fixed_iso_gauss'
+        self.outlin = outlin
 
         self.fc1 = nn.Linear(self.L1, self.Ks[1])
         #initializationhelper(self.fc1, 'relu')
@@ -1485,6 +1541,23 @@ class VAE(nn.Module):
 
         self.fc4 = nn.Linear(self.Ks[1], self.L2)
         #initializationhelper(self.fc4, 'relu')
+
+            
+    def initialize_GMMparams(self, GMM=None, mode='GMMinit'): 
+        if mode == 'random':
+            Kmog = 10
+
+            self.Kmog = Kmog
+            self.mus = nn.Parameter(1*torch.randn(self.Ks[0], Kmog))
+            self.sigs = nn.Parameter(torch.ones(self.Ks[0], Kmog))
+            self.pis = nn.Parameter(torch.ones(Kmog)/Kmog)
+        elif mode == 'GMMinit':
+            self.mus = nn.Parameter(torch.from_numpy(GMM.means_).t().float())
+            self.sigs = nn.Parameter(torch.from_numpy(GMM.covariances_).t().float())
+            self.pis = nn.Parameter(torch.from_numpy(GMM.weights_).float())
+            self.Kmog = self.pis.size(0)
+        else:
+            raise ValueError('What Mode?')
 
 
 
@@ -1502,7 +1575,10 @@ class VAE(nn.Module):
 
     def decode(self, z):
         z1 = F.tanh(self.fc3(z))
-        return F.sigmoid(self.fc4(z1))
+        if self.outlin == 'sigmoid':
+            return F.sigmoid(self.fc4(z1))
+        else:
+            return self.fc4(z1)
 
     def forward(self, inp):
         #if not (type(inp) == Variable):
@@ -1517,12 +1593,12 @@ class VAE(nn.Module):
     def criterion(self, recon_x, x, mu, logvar):
         eps = 1e-20
         #criterion = lambda lam, tar: torch.mean(-tar*torch.log(lam+eps) + lam)
-        #crt = lambda xhat, tar: torch.sum(((xhat - tar)**2 ), 1)
-        mask = torch.ge(recon_x, 1).float()
-        mask2 = torch.le(recon_x, 0).float()
-        recon_x = mask*(1-eps) + (1-mask)*recon_x
-        recon_x = mask2*eps + (1-mask)*recon_x
-        crt = lambda xhat, tar: -torch.sum(tar*torch.log(xhat+eps) + (1-tar)*torch.log(1-xhat+eps), 1)
+        crt = lambda xhat, tar: torch.sum(((xhat - tar).abs() ), 1)
+        #mask = torch.ge(recon_x, 1).float()
+        #mask2 = torch.le(recon_x, 0).float()
+        #recon_x = mask*(1-eps) + (1-mask)*recon_x
+        #recon_x = mask2*eps + (1-mask)*recon_x
+        #crt = lambda xhat, tar: -torch.sum(tar*torch.log(xhat+eps) + (1-tar)*torch.log(1-xhat+eps), 1)
 
         BCE = crt(recon_x, x)
         v = 1
@@ -1531,13 +1607,176 @@ class VAE(nn.Module):
         #KLD = KLD /(x.size(0) * x.size(1))
         return BCE + KLD
 
+    def criterion_mog(self, recon_x, x, mu, logvar, data='mnist'):
+        eps = 1e-20
+        recon_x = recon_x.view(-1, self.L2)
+        x = x.view(-1, self.L2)
+        if data == 'celeba':
+            crt = lambda xhat, tar: torch.sum(((xhat - tar)**2 ), 1)
+        elif data == 'mnist':
+            crt = lambda xhat, tar: -torch.sum(tar*torch.log(xhat+eps) + (1-tar)*torch.log(1-xhat+eps), 1)
+        else:
+            raise ValueError('What Data?')
+
+        BCE = crt(recon_x, x)
+
+        loss1 = -((self.mus.unsqueeze(0) - mu.unsqueeze(-1))**2)/self.sigs.unsqueeze(0) - self.sigs.log().unsqueeze(0) 
+        loss2 = -(logvar.unsqueeze(-1) - self.sigs.log().unsqueeze(0)).exp()
+
+        zs = mu + torch.randn(mu.size()).cuda() * (0.5*logvar).exp()
+        resp = F.softmax( (-(0.5*(self.mus.unsqueeze(0) - zs.unsqueeze(-1))**2)/self.sigs.unsqueeze(0)).sum(1) - 0.5*self.sigs.log().sum(0).unsqueeze(0) + self.pis.unsqueeze(0).log(), dim=-1)
+
+        term1 = 0.5*((loss1 + loss2).sum(1) * resp).sum(-1)
+
+        term2 = (resp * (torch.log(self.pis).unsqueeze(0) - torch.log(resp+eps))).sum(1)  \
+                + 0.5 * (1 + logvar).sum(1)  
+
+        NELBO =  - term1 - term2 + BCE
+        
+        return NELBO
+
+        #crt = lambda xhat, tar: torch.sum(((xhat - tar).abs() ), 1)
+        #resp = F.softmax((loss1 + self.pis.unsqueeze(0).unsqueeze(0).log()).sum(1), dim=-1)
+        
+        #resp2 = F.softmax(-((self.mus.unsqueeze(0) - zs.unsqueeze(-1))**2).sum(1), dim=1)
+        
     def generate_data(self, N, base_dist='fixed_iso_gauss'):
-        seed = torch.randn(N, self.Ks[0]) 
-        if self is self.cuda(): 
-            seed = seed.cuda()
-        seed = Variable(seed)
-        gen_data = self.decode(seed)
-        return gen_data, seed
+
+        if base_dist == 'fixed_iso_gauss':
+            seed = torch.randn(N, self.Ks[0]) 
+            if next(self.parameters()).is_cuda:
+            #self is self.cuda(): 
+                seed = seed.cuda()
+            seed = Variable(seed)
+            gen_data = self.decode(seed)
+            return gen_data, seed
+        elif base_dist == 'mog':
+            clsts = np.random.choice(range(self.Kmog), N, p=self.pis.data.cpu().numpy())
+            mus = self.mus[:, clsts]
+            randn = torch.randn(mus.size())
+            if next(self.parameters()).is_cuda:
+                randn = randn.cuda()
+
+            zs = mus + (self.sigs[:, clsts].sqrt())*randn
+            gen_data = self.decode(zs.t())
+            return gen_data, zs
+        elif base_dist == 'mog_skt':
+            seed = self.GMM.sample(N)[0]
+            seed = torch.from_numpy(seed).float()
+
+            if self.cuda:
+                seed = seed.cuda()
+            return self.decode(seed), seed
+        elif base_dist == 'mog_cuda':
+            seed = self.GMM.sample(N)
+            return self.decode(seed), seed
+        else:
+            raise ValueError('what base distribution?')
+
+    
+    def VAE_trainer_mog(self, cuda, train_loader, 
+                        EP = 400,
+                        vis = None, config_num=0, data='mnist', **kwargs):
+
+        if hasattr(kwargs, 'optimizer'):
+            optimizer = kwargs['optimizer']
+        else:
+            optimizer = 'Adam'
+
+        self.train(mode=True)
+
+        L1 = self.L1
+        L2 = self.L2
+        Ks = self.Ks
+
+        lr = 1e-4
+        if optimizer == 'Adam':
+            optimizerG = optim.Adam(self.parameters(), lr=lr, betas=(0.5, 0.999))
+        elif optimizer == 'RMSprop':
+            optimizerG = optim.RMSprop(self.parameters(), lr=lr)
+        elif optimizer == 'SGD':
+            optimizerG = optim.SGD(self.parameters(), lr=lr)
+        elif optimizer == 'LBFGS':
+            optimizerG = optim.LBFGS(self.parameters(), lr=lr)
+
+        nbatches = 1400
+        for ep in range(EP):
+            for i, (tar, _) in enumerate(it.islice(train_loader, 0, nbatches, 1)):
+                if cuda:
+                    tar = tar.cuda()
+
+                tar = tar.view(-1, L2)
+                tar = Variable(tar)
+
+                # generator gradient
+                self.zero_grad()
+                out_g, mu, logvar, h = self.forward(tar)
+                
+                err_G = self.criterion_mog(out_g, tar, mu, logvar, data)
+                err_G = err_G.mean(0)
+
+                err_G.backward(retain_graph=True)
+
+                # step 
+                optimizerG.step()
+                self.pis.data = self.pis.data.abs() / self.pis.data.abs().sum()
+
+                print('EP [{}/{}], error = {}, batch = [{}/{}], config num {}'.format(ep+1, EP, err_G.data[0], i+1, len(train_loader), config_num))
+                                                                       
+                if data == 'mnist':
+                    per = 10
+                elif data == 'celeba':
+                    per = 2
+                else:
+                    per = 10 
+
+
+                if (ep % per) == 0 and i == 0:
+                    # visdom plots
+                    # generate samples 
+
+                    self.eval()
+                    N = 64
+                    self.train(mode=False)
+                    gen_data, seed = self.generate_data(N, base_dist='mog')
+                    self.train(mode=True)
+
+                    if 1:
+                        opts={}
+                        opts['title'] = 'Generated Images'
+                        vis.images(gen_data.data.cpu()*0.5 + 0.5, opts=opts, win='vade')
+                        
+                        opts['title'] = 'Approximations'
+                        vis.images(0.5*out_g.data.cpu() + 0.5, opts=opts, win='vae_approximations')
+                        opts['title'] = 'Input images'
+                        vis.images(tar.data.cpu()*0.5 + 0.5, opts=opts, win='vae_x')
+
+
+                    elif 0:
+                                                
+                        sz = 800
+                        opts={'width':sz, 'height':sz, 'xmax':1.5}
+                        gen_images = ut.collate_images(out_g, N=N)
+                        opts['title'] = 'VAE Approximations'
+                        vis.heatmap(gen_images, opts=opts, win='vae_approximations')
+                        
+                        input_images = ut.collate_images(tar, N) 
+                        opts['title'] = 'VAE Input images'
+                        vis.heatmap(input_images, opts=opts, win='vae_x')
+
+                        gen_images = ut.collate_images(gen_data, N)
+                        opts['title'] = 'VAE Generated Images'
+                        vis.heatmap(gen_images, opts=opts, win='vae_gen_data')
+
+                        means = self.decode(self.mus.t())
+                        mean_images = ut.collate_images(means, N=self.Kmog)
+                        opts['title'] = 'cluster center images'
+                        vis.heatmap(mean_images, opts=opts, win='center images')
+                    
+        return h
+
+
+    
 
     def VAE_trainer(self, cuda, train_loader, 
                     EP = 400,
@@ -1554,9 +1793,9 @@ class VAE(nn.Module):
         L2 = self.L2
         Ks = self.Ks
 
-        lr = 5e-4
+        lr = 1e-5
         if optimizer == 'Adam':
-            optimizerG = optim.Adam(self.parameters(), lr=lr, betas=(0.9, 0.999))
+            optimizerG = optim.Adam(self.parameters(), lr=lr, betas=(0.5, 0.999))
         elif optimizer == 'RMSprop':
             optimizerG = optim.RMSprop(self.parameters(), lr=lr)
         elif optimizer == 'SGD':
@@ -1564,11 +1803,14 @@ class VAE(nn.Module):
         elif optimizer == 'LBFGS':
             optimizerG = optim.LBFGS(self.parameters(), lr=lr)
 
-        nbatches = 1300
+        nbatches = 1400
         for ep in range(EP):
             for i, (tar, _) in enumerate(it.islice(train_loader, 0, nbatches, 1)):
                 if cuda:
                     tar = tar.cuda()
+
+                if 1:
+                    tar = tar[:, :2, :, :]
 
                 tar = tar.view(-1, L2)
                 tar = Variable(tar)
@@ -1585,41 +1827,101 @@ class VAE(nn.Module):
                 optimizerG.step()
                 print('EP [{}/{}], error = {}, batch = [{}/{}], config num {}'.format(ep+1, EP, err_G.data[0], i+1, len(train_loader), config_num))
                                                                        
-            # visdom plots
-            # generate samples 
-            gen_data, seed = self.generate_data(100, cuda)
+                
+                if (i % 50) == 0:
+                    # visdom plots
+                    # generate samples 
 
-            if ep % 1 == 0:
-                if 0:
-                    
-                    N = 64
-                    sz = 800
-                    opts={'width':sz, 'height':sz, 'xmax':1.5}
-                    gen_images = ut.collate_images(out_g, N=N)
-                    opts['title'] = 'VAE Approximations'
-                    vis.heatmap(gen_images, opts=opts, win='vae_approximations')
-                    
-                    input_images = ut.collate_images(tar, N) 
-                    opts['title'] = 'VAE Input images'
-                    vis.heatmap(input_images, opts=opts, win='vae_x')
+                    self.eval()
+                    self.train(mode=False)
+                    gen_data, seed = self.generate_data(30, cuda)
+                    self.train(mode=True)
 
-                    gen_images = ut.collate_images(gen_data, N)
-                    opts['title'] = 'VAE Generated Images'
-                    vis.heatmap(gen_images, opts=opts, win='vae_gen_data')
-                else: 
-                    N = 64
-                    sz = 800
-                    tar = tar.view(-1, 3, 64, 64)
+                    if 0:
+                        im1 = ut.collate_images_rectangular(out_g.data, 16, 4, L1=456, L2=320)
+                        opts = {'title':'xhat'}
+                        vis.heatmap(im1, win='xhat', opts=opts)
 
-                    opts={'width':sz, 'height':sz, 'xmax':1.5}
-                    opts['title'] = 'VAE Approximations'
-                    vis.images(0.5*out_g.data.cpu() + 0.5, opts=opts, win='vae_approximations')
-                    opts['title'] = 'VAE Input images'
-                    vis.images(tar.data.cpu()*0.5 + 0.5, opts=opts, win='vae_x')
+                        im2 = ut.collate_images_rectangular(tar.data, 16, 4, L1=456, L2=320)
+                        vis.heatmap(im2, win='x', opts=opts)
 
-                    opts['title'] = 'VAE Generated Images'
-                    vis.images(gen_data.data.cpu()*0.5 + 0.5, opts=opts, win='vae_gen_data')
+                        im3 = ut.collate_images_rectangular(gen_data.data, 16, 4, L1=456, L2=320)
+                        opts = {'title':'gen_data'}
 
+                        vis.heatmap(im3, win='xgen', opts=opts)
+
+
+                    elif 0:
+                        
+                        N = 64
+                        sz = 800
+                        opts={'width':sz, 'height':sz, 'xmax':1.5}
+                        gen_images = ut.collate_images(out_g, N=N)
+                        opts['title'] = 'VAE Approximations'
+                        vis.heatmap(gen_images, opts=opts, win='vae_approximations')
+                        
+                        input_images = ut.collate_images(tar, N) 
+                        opts['title'] = 'VAE Input images'
+                        vis.heatmap(input_images, opts=opts, win='vae_x')
+
+                        gen_images = ut.collate_images(gen_data, N)
+                        opts['title'] = 'VAE Generated Images'
+                        vis.heatmap(gen_images, opts=opts, win='vae_gen_data')
+                    elif 0: 
+                        N = 64
+                        sz = 800
+                        tar = tar.view(-1, 3, 320, 456)
+
+                        opts={'width':sz, 'height':sz, 'xmax':1.5}
+                        opts['title'] = 'VAE Approximations'
+                        vis.images(0.5*out_g.data.cpu() + 0.5, opts=opts, win='vae_approximations')
+                        opts['title'] = 'VAE Input images'
+                        vis.images(tar.data.cpu()*0.5 + 0.5, opts=opts, win='vae_x')
+
+                    elif 1: 
+                        N = 64
+                        sz = 800
+                        tar = tar.view(-1, 2, 320, 456)
+                        tar_3 = torch.cat([tar, -torch.ones(tar.size(0), 1, 320, 456).cuda()], dim=1)
+
+                        if not os.path.exists('temp_results'):
+                            os.mkdir('temp_results')
+
+                        torchvision.utils.save_image(tar_3.data.cpu()*0.5 + 0.5, 'temp_results/vae_x.png', nrow=8, padding=2)
+
+                        out_g_3 = torch.cat([out_g, -torch.ones(tar.size(0), 1, 320, 456).cuda()], dim=1)
+
+                        torchvision.utils.save_image(0.5*out_g_3.data.cpu() + 0.5, 'temp_results/vae_approximations.png', nrow=8, padding=2)
+
+                        gen_3 = torch.cat([gen_data, -torch.ones(gen_data.size(0), 1, 320, 456).cuda()], dim=1)
+
+                        torchvision.utils.save_image(0.5*gen_3.data.cpu() + 0.5, 'temp_results/vae_gendata.png', nrow=8, padding=2)
+
+
+
+                        #opts['title'] = 'VAE Generated Images'
+                        #vis.images(gen_data.data.cpu()*0.5 + 0.5, opts=opts, win='vae_gen_data')
+                    else: 
+                        opts = {}
+                        opts['title'] = 'Training Data'
+                        vis.scatter(tar.data.cpu(), win='x', opts=opts, name='x')
+
+                        opts['title'] = 'Generated Data'
+                        vis.scatter(gen_data.data.cpu(), win='xgen', opts=opts)
+
+                        #opts['title'] = 'Training Data Histogram'
+                        #vis.mesh(data.cpu(), win='x_heat', opts=opts)
+
+                        opts['title'] = 'Mappings to Base Distribution Space'
+                        vis.scatter(h.data.cpu(), win='hhat', opts=opts)
+
+                        #opts['title'] = 'Mapping Back to observation space'
+                        #vis.scatter(inv_f[-1].data.cpu(), win='xhat', opts=opts)
+
+                        #opts['title'] = 'Epoch vs Cost'
+                        #opts['xtype'], opts['ytype'] = 'linear', 'log'
+                        #vis.line(Y=all_costs[:ep+1], X=torch.arange(1,ep+2), opts=opts, win='cost')
+        return h
 
 
 class conv_VAE(VAE):
@@ -1688,6 +1990,103 @@ class conv_VAE(VAE):
         z1 = nn.parallel.data_parallel(self.decoder, z, range(self.num_gpus))
         return z1
 
+    #def criterion(self, recon_x, x, mu, logvar):
+    #    eps = 1e-20
+    #    recon_x = recon_x.view(-1, self.L2)
+    #    x = x.view(-1, self.L2)
+    #    crt = lambda xhat, tar: torch.sum(((xhat - tar)**2 ), 1)
+
+    #    BCE = crt(recon_x, x)
+    #    v = 1
+    #    KLD = -0.5 * torch.sum(1 + logvar - ((mu.pow(2) + logvar.exp())/v), 1)
+    #    # Normalise by same number of elements as in reconstruction
+    #    # KLD = KLD /(x.size(0) * x.size(1))
+    #    return BCE + KLD
+
+    #def generate_data(self, N, base_dist='fixed_iso_gauss'):
+    #    #self.train(mode=False)
+    #    #self.eval()
+    #    seed = torch.randn(N, self.Ks[0]) 
+    #    if self is self.cuda(): 
+    #        seed = seed.cuda()
+    #    seed = Variable(seed)
+    #    gen_data = self.decode(seed)
+
+    #    return gen_data, seed
+
+class conv_VAE_mouse(VAE):
+    def __init__(self, L1, L2, Ks, M, num_gpus=4):
+        super(conv_VAE_mouse, self).__init__(L1, L2, Ks, M)
+
+        self.fc1 = None
+        self.fc21 = None
+        self.fc22 = None
+        self.fc3 = None
+        self.fc4 = None
+
+        self.num_gpus = num_gpus
+        K = self.K = Ks[0]
+        
+        nI = math.ceil(456/5)
+        nJ = math.ceil(320/5) 
+
+        d=8
+
+        self.decoder = nn.Sequential(
+                nn.ConvTranspose2d(K, d*8, (nI, nJ + 4), 1, 0),
+                nn.BatchNorm2d(8*d),
+                nn.ReLU(True),
+                
+                nn.ConvTranspose2d(d*8, d*4, (nI, nJ), 1, 0),
+                nn.BatchNorm2d(d*4),
+                nn.ReLU(True),
+
+                nn.ConvTranspose2d(d*4, d*2, (nI, nJ), 1, 0),
+                nn.BatchNorm2d(d*2),
+                nn.ReLU(True),
+
+                nn.ConvTranspose2d(d*2, d, (nI, nJ), 1, 0),
+                nn.BatchNorm2d(d),
+                nn.ReLU(True),
+
+                nn.ConvTranspose2d(d, 1, (nI, nJ), 1, 0),
+                nn.Tanh()
+            )
+
+                
+        self.encoder = nn.Sequential(
+            nn.Conv2d(1, d, (nI, nJ), 1, 0),
+            nn.BatchNorm2d(d),
+            nn.ReLU(True),
+            
+            nn.Conv2d(d, d*2, (nI, nJ), 1, 0),
+            nn.BatchNorm2d(d*2),
+            nn.ReLU(True),
+
+            nn.Conv2d(d*2, d*4, (nI, nJ), 1, 0),
+            nn.BatchNorm2d(d*4),
+            nn.ReLU(True),
+
+            nn.Conv2d(d*4, d*8, (nI, nJ), 1, 0),
+            nn.BatchNorm2d(d*8),
+            nn.ReLU(True),
+            
+            nn.Conv2d(d*8, 2*K, (nI, nJ + 4), 1, 0),
+            #nn.ReLU(True)
+        )
+        self.L2 = 456*320
+
+    def encode(self, x):
+        x = x.view(-1, 1, 456, 320)
+        #nn.parallel.data_parallel(self.enc, inp, range(self.num_gpus))
+        h = nn.parallel.data_parallel(self.encoder, x, range(self.num_gpus))
+        return (h[:, :self.K, 0, 0]), h[:, self.K:, 0, 0]
+
+    def decode(self, z):
+        z = z.contiguous().view(-1, self.K, 1, 1)
+        z1 = nn.parallel.data_parallel(self.decoder, z, range(self.num_gpus))
+        return z1
+
     def criterion(self, recon_x, x, mu, logvar):
         eps = 1e-20
         recon_x = recon_x.view(-1, self.L2)
@@ -1710,6 +2109,245 @@ class conv_VAE(VAE):
         seed = Variable(seed)
         gen_data = self.decode(seed)
         return gen_data, seed
+
+class conv_VAE_mouse_v2(conv_VAE_mouse):
+    def __init__(self, L1, L2, Ks, M, num_gpus=4):
+        super(conv_VAE_mouse_v2, self).__init__(L1, L2, Ks, M)
+
+        self.fc1 = None
+        self.fc21 = None
+        self.fc22 = None
+        self.fc3 = None
+        self.fc4 = None
+
+        self.num_gpus = num_gpus
+        K = self.K = Ks[0]
+        
+        nI = math.ceil(456/16)
+        nJ = math.ceil(320/16) 
+
+        d=32
+        self.decoder = nn.Sequential(
+
+            nn.ConvTranspose2d(K, 8*d, (nI, nJ+1), stride=1, padding=(0, 0)),
+            nn.BatchNorm2d(8*d),
+            nn.Tanh(),
+            #nn.LeakyReLU(),
+
+            nn.ConvTranspose2d(8*d, 4*d, (nI, nJ), stride=2, padding=(round(nI/2), round(nJ/2))),
+            nn.BatchNorm2d(4*d),
+            nn.Tanh(),
+            #nn.LeakyReLU(),
+
+            nn.ConvTranspose2d(4*d, 2*d, (nI, nJ), stride=2, padding=(round(nI/2), round(nJ/2))),
+            nn.BatchNorm2d(2*d),
+            nn.Tanh(),
+            #nn.LeakyReLU(),
+
+            nn.ConvTranspose2d(2*d, d, (nI, nJ), stride=2, padding=(round(nI/2), round(nJ/2))),
+            nn.BatchNorm2d(d),
+            nn.Tanh(),
+            #nn.LeakyReLU(),
+
+            nn.ConvTranspose2d(d, 1, (nI + 1, nJ), stride=2, padding=(round(nI/2) -3, round(nJ/2) - 7)),
+            nn.Tanh(),
+                
+            )
+
+                
+        self.encoder = nn.Sequential(
+            nn.Conv2d(1, d, (nI, nJ), stride=2, padding=(round(nI/2), round(nJ/2))),
+            nn.BatchNorm2d(d),
+            nn.Tanh(),
+            #nn.LeakyReLU(),
+
+            nn.Conv2d(d, 2*d, (nI, nJ), stride=2, padding=(round(nI/2), round(nJ/2))),
+            nn.BatchNorm2d(2*d),
+            nn.Tanh(),
+            #nn.LeakyReLU(),
+
+            nn.Conv2d(2*d, 4*d, (nI, nJ), stride=2, padding=(round(nI/2), round(nJ/2))),
+            nn.BatchNorm2d(d*4),
+            nn.Tanh(),
+            #nn.LeakyReLU(),
+
+            nn.Conv2d(4*d, 8*d, (nI, nJ), stride=2, padding=(round(nI/2), round(nJ/2))),
+            nn.BatchNorm2d(d*8),
+            nn.Tanh(),
+            #nn.LeakyReLU(),
+
+            nn.Conv2d(8*d, 2*K, (nI, nJ+1), stride=1, padding=(0, 0)),
+
+            #nn.ReLU(True)
+        )
+        self.L2 = 456*320
+        self.loss = 'l1'
+
+    def encode(self, x):
+        x = x.view(-1, 1, 456, 320)
+        #nn.parallel.data_parallel(self.enc, inp, range(self.num_gpus))
+
+        #h = self.encoder(x)
+
+        #print(h.size())
+
+
+        h = nn.parallel.data_parallel(self.encoder, x, range(self.num_gpus))
+
+        return (h[:, :self.K, 0, 0]), h[:, self.K:, 0, 0]
+
+    def generate_data(self, N, base_dist='fixed_iso_gauss'):
+        self.train(mode=False)
+        #self.eval()
+        seed = torch.randn(N, self.Ks[0]) 
+        if self is self.cuda(): 
+            seed = seed.cuda()
+        seed = Variable(seed)
+        gen_data = self.decode(seed)
+        return gen_data, seed
+
+    def criterion(self, recon_x, x, mu, logvar):
+        eps = 1e-20
+        recon_x = recon_x.view(-1, self.L2)
+        x = x.view(-1, self.L2)
+        if self.loss == 'l2':
+            crt = lambda xhat, tar: torch.sum(((xhat - tar)**2 ), 1)
+        elif self.loss == 'l1':
+            crt = lambda xhat, tar: torch.sum((xhat - tar).abs(), 1)
+
+        BCE = crt(recon_x, x)
+        v = 1
+        KLD = -0.5 * torch.sum(1 + logvar - ((mu.pow(2) + logvar.exp())/v), 1)
+        # Normalise by same number of elements as in reconstruction
+        # KLD = KLD /(x.size(0) * x.size(1))
+        return BCE + KLD
+
+class conv_VAE_mouse_v3(conv_VAE_mouse_v2):
+    def __init__(self, L1, L2, Ks, M, num_gpus=4):
+        super(conv_VAE_mouse_v3, self).__init__(L1, L2, Ks, M)
+
+        self.fc1 = None
+        self.fc21 = None
+        self.fc22 = None
+        self.fc3 = None
+        self.fc4 = None
+
+        self.num_gpus = num_gpus
+        K = self.K = Ks[0]
+        
+        nI = 4#math.ceil(L1/32)
+        nJ = 4#math.ceil(L2/32) 
+
+        d=128
+        self.decoder = nn.Sequential(
+
+            nn.ConvTranspose2d(K, 2*d, (nI + 17, nJ + 26), stride=1, padding=(0, 0)),
+            nn.BatchNorm2d(2*d),
+            #nn.Tanh(),
+            nn.LeakyReLU(),
+
+            nn.Upsample(scale_factor=2, mode='bilinear'),
+            #nn.ConvTranspose2d(8*d, 4*d, (nI, nJ), stride=2, padding=(round(nI/2), round(nJ/2))),
+            #nn.BatchNorm2d(4*d),
+            #nn.Tanh(),
+            #nn.LeakyReLU(),
+
+            nn.ConvTranspose2d(2*d, d, (nI, nJ), stride=2, padding=(round(nI/2), round(nJ/2))),
+            nn.BatchNorm2d(d),
+            #nn.Tanh(),
+            nn.LeakyReLU(),
+
+            nn.Upsample(scale_factor=2, mode='bilinear'),
+            #nn.ConvTranspose2d(2*d, d, (nI, nJ), stride=2, padding=(round(nI/2), round(nJ/2))),
+            #nn.BatchNorm2d(d),
+            #nn.Tanh(),
+            #nn.LeakyReLU(),
+
+            nn.ConvTranspose2d(d, d, (nI+4, nJ+6), stride=2, padding=(round(nI/2)+5, round(nJ/2)+10 )),
+            nn.BatchNorm2d(d),
+            nn.LeakyReLU(),
+
+            nn.ConvTranspose2d(d, 2, (nI+1, nJ+1), stride=1, padding=(round(nI/2), round(nJ/2))),
+
+
+            nn.Tanh(),
+                
+            )
+
+                
+        self.encoder = nn.Sequential(
+            nn.Conv2d(2, d, (nI, nJ), stride=2, padding=(round(nI/2), round(nJ/2))),
+            nn.BatchNorm2d(d),
+            #nn.Tanh(),
+            nn.LeakyReLU(),
+
+            #nn.Conv2d(d, 2*d, (nI, nJ), stride=2, padding=(round(nI/2), round(nJ/2))),
+            nn.MaxPool2d((nI, nJ), stride=2, padding=(round(nI/2), round(nJ/2))),
+            #nn.BatchNorm2d(2*d),
+            #nn.Tanh(),
+            #nn.LeakyReLU(),
+
+            nn.Conv2d(d, 2*d, (nI, nJ), stride=2, padding=(round(nI/2), round(nJ/2))),
+            nn.BatchNorm2d(d*2),
+            #nn.Tanh(),
+            nn.LeakyReLU(),
+
+            nn.MaxPool2d((nI, nJ), stride=2, padding=(round(nI/2), round(nJ/2))),
+            #nn.Conv2d(4*d, 8*d, (nI, nJ), stride=2, padding=(round(nI/2), round(nJ/2))),
+            #nn.BatchNorm2d(d*8),
+            #nn.Tanh(),
+            #nn.LeakyReLU(),
+
+            nn.Conv2d(2*d, 2*K, (nI+17, nJ+26), stride=1, padding=(0, 0)),
+
+            #nn.ReLU(True)
+        )
+        self.L2 = 456*320*2
+        self.loss = 'l1'
+
+    def reparameterize(self, mu, logvar):
+        return mu
+
+
+    def encode(self, x):
+        x = x.view(-1, 2, 320, 456)
+        #nn.parallel.data_parallel(self.enc, inp, range(self.num_gpus))
+
+        #h = self.encoder(x)
+
+        #print(h.size())
+
+        h = nn.parallel.data_parallel(self.encoder, x, range(self.num_gpus))
+
+        return (h[:, :self.K, 0, 0]), h[:, self.K:, 0, 0]
+
+    def generate_data(self, N, base_dist='fixed_iso_gauss'):
+        self.train(mode=False)
+        #self.eval()
+        seed = torch.randn(N, self.Ks[0]) 
+        if self is self.cuda(): 
+            seed = seed.cuda()
+        seed = Variable(seed)
+        gen_data = self.decode(seed)
+        return gen_data, seed
+
+    def criterion(self, recon_x, x, mu, logvar):
+        eps = 1e-20
+        recon_x = recon_x.view(-1, self.L2)
+        x = x.view(-1, self.L2)
+        if self.loss == 'l2':
+            crt = lambda xhat, tar: torch.sum(((xhat - tar)**2 ), 1)
+        elif self.loss == 'l1':
+            crt = lambda xhat, tar: torch.sum((xhat - tar).abs(), 1)
+
+        BCE = crt(recon_x, x)
+        v = 1
+        KLD = -0.5 * torch.sum(1 + logvar - ((mu.pow(2) + logvar.exp())/v), 1)
+        # Normalise by same number of elements as in reconstruction
+        # KLD = KLD /(x.size(0) * x.size(1))
+        return BCE + 0.0*KLD
+
+
 
 def vis_plot_results(model, inv_f, data, vis, all_costs, ep, arguments):
     #if model.base_dist == 'mixture_full_gauss':
@@ -1783,6 +2421,7 @@ def vis_plot_results(model, inv_f, data, vis, all_costs, ep, arguments):
 
 def compute_nparam_density(test_loader, model, sig, cuda, num_samples=1, task='celeba'):
 
+    model = model.eval()
     utils = Normalizing_Flow_utils(0.1, cuda=cuda) 
 
     all_averages = []
@@ -1791,7 +2430,7 @@ def compute_nparam_density(test_loader, model, sig, cuda, num_samples=1, task='c
         gen_data = gen_data.view(-1, model.L2).data
 
         all_kdes = []
-        for i, (test_data, _) in enumerate(it.islice(test_loader,0,5000,1)):
+        for i, (test_data, _) in enumerate(it.islice(test_loader,0,500,1)):
             print('batch {}'.format(i))
             test_data = test_data.view(-1, model.L2)
             kdes = utils.compute_kde(utils.tocuda(test_data), (gen_data), sig)
@@ -1827,6 +2466,140 @@ def compute_nparam_density(test_loader, model, sig, cuda, num_samples=1, task='c
 
     return all_averages, im_gen, im_test
 
+def get_scores(test_loader, model, cuda, num_samples=1, task='celeba', 
+               base_dist='fixed_iso_gauss'):
+
+    model = model.eval()
+    sig = 1
+
+    all_test = []
+    for i, (test_data, _) in enumerate(it.islice(test_loader,0,50,1)):
+        print('batch {}'.format(i))
+        all_test.append(test_data)
+
+    all_test_cat = torch.cat(all_test, dim=0)
+    if cuda:
+        all_test_cat = all_test_cat.cuda()
+
+    mmds_lin = []
+    mmds_stt = []
+    fds_all = []
+    fids_all = []
+
+    all_test_cat_flt = all_test_cat.view(-1, model.L2)
+    for n in range(num_samples):
+        gen_data, _ = model.generate_data(100, base_dist=base_dist) 
+        gen_data_flt = gen_data.view(-1, model.L2).data
+        
+        print('computing linear mmd')
+        mmd = compute_mmd(gen_data_flt, all_test_cat_flt, sig, cuda, 
+                        kernel='linear')
+        mmds_lin.append(math.sqrt(mmd))
+        
+        print('computing stt mmd')
+        mmd = compute_mmd(gen_data_flt, all_test_cat_flt, sig, cuda, 
+                        kernel='stt')
+        mmds_stt.append(math.sqrt(mmd))
+
+        #print('computing frechet distance')
+        #fds_all.append(compute_fd(gen_data_flt, all_test_cat_flt, cuda))
+        
+        if 1:
+            print('computing frechet inception distance')
+            if task == 'celeba':
+                gen_data_fid = gen_data.data.cpu().numpy()*0.5 + 0.5
+
+                if n == 0:
+                    all_test_cat = all_test_cat.cpu().numpy()*0.5 + 0.5
+            elif task == 'mnist':
+                gen_data_fid = gen_data.data.cpu().view(-1, 1, 28, 28)
+                gen_data_fid = gen_data_fid.expand(-1, 3, -1, -1).numpy()
+
+                if n == 0:
+                    all_test_cat = all_test_cat.cpu().view(-1, 1, 28, 28)
+                    all_test_cat = all_test_cat.expand(-1, 3, -1, -1).numpy()
+
+            fids_all.append(fid.calculate_fig_given_arrays(gen_data_fid, all_test_cat,
+                            64, cuda, 2048))
+
+    return {'mmd_lin' : mmds_lin,
+            'mmd_stt' : mmds_stt,
+            'frechet' : fds_all,
+            'frechet_inception' : fids_all}, gen_data
+            
+def compute_mmd(X, Y, sig, cuda, kernel='linear', biased=True):
+
+    utils = Normalizing_Flow_utils(0.1, cuda=cuda) 
+    gamma = 1 / (2 * sig**2)
+
+    XX = torch.matmul(X, X.t())
+    XY = torch.matmul(X, Y.t())
+    YY = torch.matmul(Y, Y.t())
+
+    X_sqnorms = torch.diag(XX)
+    Y_sqnorms = torch.diag(YY)
+
+    m = XX.size(0)
+    n = YY.size(0)
+
+    if kernel == 'rbf':
+        K_XY = (-gamma * (
+                -2 * XY + X_sqnorms[:, np.newaxis] + Y_sqnorms[np.newaxis, :]))
+        K_XX = (-gamma * (
+                -2 * XX + X_sqnorms[:, np.newaxis] + X_sqnorms[np.newaxis, :]))
+        K_YY = (-gamma * (
+                -2 * YY + Y_sqnorms[:, np.newaxis] + Y_sqnorms[np.newaxis, :]))
+
+        logKxymean = utils.logsumexp(K_XY.view(-1), 0) - math.log(m*n)
+        logKxxmean = utils.logsumexp(K_XX.view(-1), 0) - math.log(m*m)
+        logKyymean = utils.logsumexp(K_YY.view(-1), 0) - math.log(n*n)
+
+        #K_XY = utils.logsumexp(K_XY.view(-1), 0)
+        mmd2 = logKxxmean.exp() + logKyymean.exp() - 2*logKxymean.exp()
+
+        #term1 = utils.logsumexp(torch.cat([logKxxmean, logKyymean]),0)
+    #logmmd = torch.log( (term1 - logKxymean - math.log(2)).exp() - 1) + logKxymean + math.log(2) 
+        #mmd2 = K_XX.mean() + K_YY.mean() - 2 * K_XY.mean()
+    #else:
+    #    ps=1
+        #mmd2 = ((K_XX.sum() - m) / (m * (m - 1))
+        #      + (K_YY.sum() - n) / (n * (n - 1))
+        #      - 2 * K_XY.mean())
+    elif kernel == 'stt':
+        K_XY = -2*XY + X_sqnorms[:, np.newaxis] + Y_sqnorms[np.newaxis, :]
+        K_XX = -2*XX + X_sqnorms[:, np.newaxis] + X_sqnorms[np.newaxis, :]
+        K_YY = -2*YY + Y_sqnorms[:, np.newaxis] + Y_sqnorms[np.newaxis, :]
+
+        mmd2 = (1/(1 + K_XX)).mean() + (1/(1 + K_YY)).mean() - 2*(1/(1 + K_XY)).mean()
+
+    elif kernel == 'linear':
+        mmd2 = XX.mean() + YY.mean() - 2*XY.mean()
+
+    elif kernel == 'tanh':
+        mmd2 = F.tanh(XX).mean() + F.tanh(YY).mean() - 2*F.tanh(XY).mean()
+
+    return mmd2
+
+def compute_fd(X, Y, cuda):
+    mX = X.mean(0).unsqueeze(0)
+    mY = Y.mean(0).unsqueeze(0)
+    
+    nx = X.size(0)
+    ny = Y.size(0)
+
+    mterm = (((mX - mY)**2).sum())
+
+    cX = torch.matmul( (X - mX).t(), (X - mX))/((nx*nx) -1 )
+    cY = torch.matmul( (Y-mY).t(), (Y-mY))/((ny*ny) -1)
+
+    #cX[cX < 0] = 0
+    #cY[cY < 0] = 0
+
+    matmul = torch.matmul(cX, cY)
+    U, S, V = torch.svd(matmul) 
+    sqrt = torch.matmul(torch.matmul(U, torch.sqrt(torch.diag(S))), V.t()) 
+    fid = mterm + torch.trace(cX + cY - 2*sqrt)
+    return fid
 
 
 
@@ -1938,35 +2711,55 @@ def adversarial_wasserstein_trainer(train_loader,
                 vis.images(out_g.data.cpu()*0.5 + 0.5, opts=opts, win='vae_gen_data')
 
 
+def get_embeddings(model, train_loader, cuda=True, flatten=True):
+    # get hhats for all batches
+    nbatches = 10
+    all_hhats = []
+    for i, (data, _) in enumerate(it.islice(train_loader, 0, nbatches, 1)):
+        if cuda:
+            data = data.cuda()
+
+        if flatten: 
+            data = data.view(-1, model.L2)
+
+        try:
+            hhat, _ = model.encode(data)
+        except:
+            hhat = model.encode(data)
+
+        all_hhats.append(hhat.data.squeeze())
+        print('processing batch {}'.format(i))
+
+    return torch.cat(all_hhats, dim=0)
+
 
 class conv_autoenc(nn.Module):
     # initializers
     def __init__(self, d=128, K=100, Kdict=30, base_inits=20, num_gpus=1):
         super(conv_autoenc, self).__init__()
 
-        self.usesequential = True if num_gpus > 1 else False
+        self.usesequential = False #True if num_gpus > 1 else False
         self.num_gpus = num_gpus
         if self.usesequential:
             self.decoder = nn.Sequential(
                     nn.ConvTranspose2d(K, d*8, 4, 1, 0),
-                    nn.BatchNorm2d(8*d),
+                    #nn.BatchNorm2d(8*d),
                     nn.ReLU(True),
                     
                     nn.ConvTranspose2d(d*8, d*4, 4, 2, 1),
-                    nn.BatchNorm2d(d*4),
+                    #nn.BatchNorm2d(d*4),
                     nn.ReLU(True),
 
                     nn.ConvTranspose2d(d*4, d*2, 4, 2, 1),
-                    nn.BatchNorm2d(d*2),
+                    #nn.BatchNorm2d(d*2),
                     nn.ReLU(True),
 
                     nn.ConvTranspose2d(d*2, d, 4, 2, 1),
-                    nn.BatchNorm2d(d),
+                    #nn.BatchNorm2d(d),
                     nn.ReLU(True),
 
                     nn.ConvTranspose2d(d, 3, 4, 2, 1),
                     nn.Tanh()
-
                 )
 
         else:
@@ -1979,26 +2772,31 @@ class conv_autoenc(nn.Module):
         
         self.encoder = nn.Sequential(
             nn.Conv2d(3, d, 4, 2, 1),
-            nn.BatchNorm2d(d),
+            #nn.BatchNorm2d(d),
             nn.ReLU(True),
             
             nn.Conv2d(d, d*2, 4, 2, 1),
-            nn.BatchNorm2d(d*2),
+            #nn.BatchNorm2d(d*2),
             nn.ReLU(True),
 
             nn.Conv2d(d*2, d*4, 4, 2, 1),
-            nn.BatchNorm2d(d*4),
+            #nn.BatchNorm2d(d*4),
             nn.ReLU(True),
 
             nn.Conv2d(d*4, d*8, 4, 2, 1),
-            nn.BatchNorm2d(d*8),
+            #nn.BatchNorm2d(d*8),
             nn.ReLU(True),
             
             nn.Conv2d(d*8, K, 4, 1, 0),
+            #nn.ReLU(True)
         )
-        self.GMM = mix.GaussianMixture(n_components=Kdict, verbose=1, n_init=base_inits, max_iter = 200, covariance_type='full')
+        self.GMM = mix.GaussianMixture(n_components=Kdict, verbose=1, n_init=base_inits, max_iter=200, covariance_type='full', warm_start=True)
+        
         self.base_dist = 'mixture_full_gauss'
         self.L2 = 3*64*64
+
+        self.flatten = False
+        self.cost_type = 'l2'
 
 
     # weight_init
@@ -2023,8 +2821,14 @@ class conv_autoenc(nn.Module):
         h = nn.parallel.data_parallel(self.encoder, x, range(self.num_gpus))
         return h
 
-    def trainer(self, train_loader, vis, EP, cuda, config_num=0):
-        opt = torch.optim.Adam(self.parameters(), lr=2e-5, betas=(0.5, 0.999)) 
+    def trainer(self, train_loader, vis, EP, cuda, config_num=0,
+                regularizer='None', zs_all=None):
+
+        if regularizer == 'None':
+            lr = 1e-4
+        else:
+            lr = 2e-5
+        opt = torch.optim.Adam(self.parameters(), lr=lr, betas=(0.5, 0.999)) 
 
         nbatches = 25000 
         for ep in range(EP):
@@ -2032,51 +2836,263 @@ class conv_autoenc(nn.Module):
                 self.zero_grad()
                 if cuda:
                     dt = dt.cuda()
+                
+                if self.flatten:
+                    dt = dt.view(-1, self.L2)
+
                 h = self.encode(Variable(dt))
+
                 xhat = self.decode(h)
-                cost = ((Variable(dt) - xhat)**2).mean()
+
+                if self.cost_type == 'bernoulli':
+                    cost = Variable(dt)*torch.log(xhat) + (1-Variable(dt))*torch.log(1-xhat)
+                    cost = -cost.mean()
+                elif self.cost_type == 'l1':
+                    cost = ((Variable(dt) - xhat).abs()).mean()
+                elif self.cost_type == 'l2':
+                    cost = ((Variable(dt) - xhat)**2).mean()
+
+                if regularizer is not 'None':
+
+                    zs = torch.max(zs_all[i], 1)[1]
+
+                    means = torch.index_select(self.GMM.means, dim=0, index=zs)
+                    icovs = torch.index_select(self.GMM.icovs, dim=0, index=zs)
+
+                    h_cent = h - Variable(means)
+                    temp = torch.matmul(h_cent.unsqueeze(1), Variable(icovs)).squeeze()
+
+                    #h_cent_all = h.unsqueeze(1) - Variable(self.GMM.means.unsqueeze(0)) 
+
+                    #all_covs = torch.matmul(h_cent_all.permute(1, 2, 0), h_cent_all.permute(1, 0, 2)*Variable(zs_all[i].t().unsqueeze(-1)))
+                    #all_covs = all_covs / Variable(zs_all[i].sum(0).view(-1, 1, 1))
+
+                    #eye = 1e-5*torch.eye(means.size(1))
+                    #if self.cuda:
+                    #    eye = eye.cuda()
+                    #eye = Variable(eye)
+                    #    
+                    #all_ent = [0.5*torch.svd(cov.squeeze())[1].log().sum() for cov in all_covs]
+                    
+                    reg = (0.5*(h_cent * temp)).mean() #- sum(all_ent)
+
+                    cost = (cost + reg).mean()
+                else:
+                    cost = cost.mean()
+
             
                 cost.backward()
 
                 opt.step()
 
+                
                 print('EP [{}/{}], batch [{}/{}],  Cost is {}, Learning rate is {}, Config num {}'.format(ep+1, EP, i+1, 
                                                                                                           len(train_loader), cost.data[0], 
                                                                                                           opt.param_groups[0]['lr'], config_num))
 
-                if i % 50 == 0:
-                    vis.images(0.5 + (dt.cpu()*0.5), win='x')
-                    vis.images(0.5 + (xhat.data.cpu()*0.5), win='xhat')
+                if ( (ep*5 + i) % 100 ) == 0:
+                    if isinstance(self, conv_autoenc_mice):
+                        im1 = ut.collate_images_rectangular(dt, 16, 4, L1=456, L2=320)
+                        vis.heatmap(im1, win='x')
+
+                        im2 = ut.collate_images_rectangular(xhat.data, 16, 4, L1=456, L2=320)
+                        vis.heatmap(im2, win='xhat')
+
+                    elif isinstance(self, mlp_autoenc):
+                        im1 = ut.collate_images(Variable(dt.view(-1, 28, 28)), 64, 8, L=28)
+                        vis.heatmap(im1, win='x')
+
+                        im2 = ut.collate_images(xhat.view(-1, 28, 28), 64, 8, L=28)
+                        vis.heatmap(im2, win='xhat')
+
+                        if regularizer is not 'None':
+                            seed = self.GMM.sample(300)
+                            gen_ims = self.decode(Variable(seed))
+                            im3 = ut.collate_images(gen_ims, N=64)
+                            vis.heatmap(im3, win='gen_x')
+
+                            if h.size(1) == 2:
+                                vis.scatter(seed.cpu(), win='samples from the prior')
+
+                        if h.size(1) == 2:
+                            ops = {'title' : 'h'}
+                            vis.scatter(h.data.cpu(), win='h')
+                        
+                    else:
+                        vis.images(0.5 + (dt.cpu()*0.5), win='x')
+                        vis.images(0.5 + (xhat.data.cpu()*0.5), win='xhat')
+
+                        
+
                  
     def gmm_trainer(self, train_loader, cuda=True, vis=None):
 
         # get hhats for all batches
-        nbatches = 2
+        nbatches = 20
         all_hhats = []
         for i, (data, _) in enumerate(it.islice(train_loader, 0, nbatches, 1)):
             if cuda:
                 data = data.cuda()
+
+            if self.flatten:
+                data = data.view(-1, self.L2)
+
             hhat = self.encoder(Variable(data))
             all_hhats.append(hhat.data.squeeze())
             print(i)
-        all_hhats = torch.cat(all_hhats, dim=0)
 
-        if vis is not None:
-            vis.heatmap(all_hhats.cpu()[:200].t(), win='hhat', opts = {'title':'hhats for reconstructions'})
+        if 0:
+            all_hhats = torch.cat(all_hhats, dim=0)
+
+            if vis is not None:
+                vis.heatmap(all_hhats.cpu()[:200].t(), win='hhat', opts = {'title':'hhats for reconstructions'})
 
 
-        # train base dist
-        data = all_hhats.cpu().numpy()
-        self.GMM.fit(data)
+            # train base dist
+            data = all_hhats.cpu().numpy()
+            self.GMM.fit(data)
+        else: 
+            self.GMM.kmeanspp(all_hhats[0])
+            self.GMM.kmeans(all_hhats, vis)
+
+            zs_all = self.GMM.em(all_hhats, em_iters=25)
+        
+        if 0:
+            for (dt, _), zs in zip(train_loader, zs_all):
+                N = 64
+                dt = dt[:N]
+
+                zs = torch.max(zs[:N], 1)[1]
+                means = torch.index_select(self.GMM.means, dim=0, index=zs)
+                xhat = self.decoder(Variable(means))
+
+                dt_im = ut.collate_images(Variable(dt), N)
+                vis.heatmap(dt_im)
+
+                xhat_im = ut.collate_images(xhat, N)
+                vis.heatmap(xhat_im)
+
+        return zs_all
     
+
+
     def generate_data(self, N, base_dist='mixture_full_gauss'):
-        seed = self.GMM.sample(N)[0]
-        seed = torch.from_numpy(seed).float()
-        seed = seed.view(N, -1, 1, 1)
+        
+        if 0:
+            seed = self.GMM.sample(N)[0]
+            seed = torch.from_numpy(seed).float()
+        else:
+            seed = self.GMM.sample(N)
+
+        if not self.flatten:
+            seed = seed.view(N, -1, 1, 1)
+            
         if self.cuda:
             seed = seed.cuda()
         seed = Variable(seed)
         return self.decode(seed), seed
+
+class mlp_autoenc(conv_autoenc):
+# initializers
+    def __init__(self, Ks, Kdict=30, base_inits=20, num_gpus=1):
+        super(mlp_autoenc, self).__init__()
+
+        self.usesequential = True if num_gpus > 1 else False
+        self.num_gpus = num_gpus
+
+        L1 = 784
+        self.Ks = Ks
+
+        self.decoder = nn.Sequential(
+                nn.Linear(Ks[0], Ks[1]),
+                nn.Tanh(),
+                
+                nn.Linear(Ks[1], L1),
+                nn.Sigmoid(),
+        )
+
+                
+        self.encoder = nn.Sequential(
+                nn.Linear(L1, Ks[1]),
+                nn.Tanh(),
+                
+                nn.Linear(Ks[1], Ks[0]),
+                #nn.LeakyReLU(),
+ 
+        )
+        #self.GMM = mix.GaussianMixture(n_components=Kdict, verbose=1, n_init=base_inits, max_iter = 200, covariance_type='full', warm_start=True, tol=1e-6)
+        #self.GMM = mix.BayesianGaussianMixture(n_components=100, verbose=1, max_iter = 200, covariance_type='full', tol=1e-3, n_init=20)
+
+        self.GMM = gmm.gmm(num_components=Kdict, L=Ks[0], cuda=True, n_iters=50) 
+        self.base_dist = 'mixture_full_gauss'
+        self.L2 = L1
+        self.flatten = True
+        self.cost_type = 'bernoulli'
+        self.M = 28
+
+
+
+class conv_autoenc_mice(conv_autoenc):
+    # initializers
+    def __init__(self, d=128, K=100, Kdict=30, base_inits=20, num_gpus=1):
+        super(conv_autoenc_mice, self).__init__()
+
+        self.usesequential = True if num_gpus > 1 else False
+        self.num_gpus = num_gpus
+
+        nI = math.ceil(456/5)
+        nJ = math.ceil(320/5) 
+
+        d=8
+
+        self.decoder = nn.Sequential(
+                nn.ConvTranspose2d(K, d*8, (nI, nJ + 4), 1, 0),
+                #nn.BatchNorm2d(8*d),
+                nn.ReLU(True),
+                
+                nn.ConvTranspose2d(d*8, d*4, (nI, nJ), 1, 0),
+                #nn.BatchNorm2d(d*4),
+                nn.ReLU(True),
+
+                nn.ConvTranspose2d(d*4, d*2, (nI, nJ), 1, 0),
+                #nn.BatchNorm2d(d*2),
+                nn.ReLU(True),
+
+                nn.ConvTranspose2d(d*2, d, (nI, nJ), 1, 0),
+                #nn.BatchNorm2d(d),
+                nn.ReLU(True),
+
+                nn.ConvTranspose2d(d, 1, (nI, nJ), 1, 0),
+                nn.Tanh()
+            )
+
+                
+        self.encoder = nn.Sequential(
+            nn.Conv2d(1, d, (nI, nJ), 1, 0),
+            #nn.BatchNorm2d(d),
+            nn.ReLU(True),
+            
+            nn.Conv2d(d, d*2, (nI, nJ), 1, 0),
+            #nn.BatchNorm2d(d*2),
+            nn.ReLU(True),
+
+            nn.Conv2d(d*2, d*4, (nI, nJ), 1, 0),
+            #nn.BatchNorm2d(d*4),
+            nn.ReLU(True),
+
+            nn.Conv2d(d*4, d*8, (nI, nJ), 1, 0),
+            #nn.BatchNorm2d(d*8),
+            nn.ReLU(True),
+            
+            nn.Conv2d(d*8, K, (nI, nJ + 4), 1, 0),
+            #nn.ReLU(True)
+        )
+        self.GMM = mix.GaussianMixture(n_components=Kdict, verbose=1, n_init=base_inits, max_iter = 200, covariance_type='full', warm_start=True)
+        self.base_dist = 'mixture_full_gauss'
+        self.L2 = 456*320
+        self.flatten = False
+        self.cost_type = 'l2'
+
 
 class netg_dcgan_par(nn.Module):
     def __init__(self, K, d=128, num_gpus=4):

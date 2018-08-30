@@ -28,17 +28,66 @@ def collate_images(data, N, ncols = 8, L=28):
     for i, row in enumerate(rows):
         row = torch.chunk(row, ncols, dim=0)
         row = [im.squeeze() for im in row]
+        #if i == nrows-1: 
+        base = torch.zeros(L, L*(ncols))
+        base[:, :(len(row))*L] = torch.cat(row, dim=1)
+        collated_rows.append(base)
+       # else:
+       #     collated_rows.append(torch.cat(row, dim=1))
+
+    collated_im = torch.cat(collated_rows, dim=0)
+
+    inds = torch.arange(L*nrows-1, -1, -1).long()
+    return torch.index_select(collated_im, dim=0, index=inds)
+
+
+def collate_images_rectangular(data, N, ncols = 8, L1=28, L2=28): 
+    nrows = int(np.ceil(N/ncols))
+
+    data = data.cpu()[:N].view(N, L1, L2) 
+    
+    rows = torch.chunk(data, nrows, dim=0) 
+    collated_rows = []
+    for i, row in enumerate(rows):
+        row = torch.chunk(row, ncols, dim=0)
+        row = [im.squeeze() for im in row]
         if i == nrows-1: 
-            base = torch.zeros(L, L*ncols)
-            base[:, :len(row)*L] = torch.cat(row, dim=1)
+            base = torch.zeros(L1, L2*ncols)
+            base[:, :len(row)*L2] = torch.cat(row, dim=1)
             collated_rows.append(base)
         else:
             collated_rows.append(torch.cat(row, dim=1))
 
     collated_im = torch.cat(collated_rows, dim=0)
 
-    inds = torch.arange(L*nrows-1, -1, -1).long()
+    inds = torch.arange(L1*nrows-1, -1, -1).long()
     return torch.index_select(collated_im, dim=0, index=inds)
+
+def collate_images_rectangular_color(data, N, ncols = 8, L1=28, L2=28): 
+    nrows = int(np.ceil(N/ncols))
+
+    data = data.cpu()[:N].view(N, 3, L1, L2) 
+    
+    rows = torch.chunk(data, nrows, dim=0) 
+    collated_rows = []
+    for i, row in enumerate(rows):
+        row = torch.chunk(row, ncols, dim=0)
+        row = [im.squeeze() for im in row]
+        if i == nrows-1: 
+            base = torch.zeros(3, L1, L2*ncols)
+            base[:, :, :len(row)*L2] = torch.cat(row, dim=2)
+            collated_rows.append(base)
+        else:
+            collated_rows.append(torch.cat(row, dim=2))
+
+    collated_im = torch.cat(collated_rows, dim=1)
+
+    collated_im = collated_im.permute(1, 2, 0)
+
+    inds = torch.arange(L1*nrows-1, -1, -1).long()
+    return collated_im #torch.index_select(collated_im, dim=0, index=inds)
+
+
 
 
 def collate_images_color(data, N, ncols = 8, L=64): 
@@ -250,11 +299,15 @@ def filter_digits(digit, loader, arguments):
     return loader
 
 
-def plot_embedding(X, images, ax, title=None):
+def plot_embedding(X, images, ax, sz=(28, 28), title=None):
     shown_images = np.array([[1., 1.]])  # just something big
+    #cmap=plt.cm.gray_r,
+    n = len(X)
+    step = round(n / 30)
+
     for x, image in zip(X, images):
         imagebox = offsetbox.AnnotationBbox(
-        offsetbox.OffsetImage(image.reshape(28, 28), cmap=plt.cm.gray_r, zoom=0.3), x)
+        offsetbox.OffsetImage(image.reshape(sz[0], sz[1]), zoom=0.3), x.squeeze())
         ax.add_artist(imagebox)
     plt.xticks([]), plt.yticks([])
     if title is not None:
@@ -336,7 +389,7 @@ def form_mixtures(digit1, digit2, loader, arguments):
 
     return loader1, loader2, loader_mix
 
-def get_loaders(loader_batchsize, c=-0.1, **kwargs):
+def get_loaders(loader_batchsize, c=-0.1, train_shuffle=True, **kwargs):
     arguments=kwargs['arguments']
     data = arguments.data
 
@@ -351,7 +404,7 @@ def get_loaders(loader_batchsize, c=-0.1, **kwargs):
                                transforms.Lambda(lam) 
                                #transforms.Normalize((0,), (1,))
                            ])),
-            batch_size=loader_batchsize, shuffle=True, **kwargs)
+            batch_size=loader_batchsize, shuffle=train_shuffle, **kwargs)
         test_loader = torch.utils.data.DataLoader(
             datasets.MNIST('../data', train=False, transform=transforms.Compose([
                                transforms.ToTensor(),
