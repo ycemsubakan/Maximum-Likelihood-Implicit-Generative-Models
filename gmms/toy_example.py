@@ -4,13 +4,13 @@ import pdb
 import gmm_learn as gmm
 import visdom
 
-vis = visdom.Visdom(port=5800, server='http://cem@nmf.cs.illinois.edu', env='cem_dev')
+vis = visdom.Visdom(port=5800, server='http://cem@nmf.cs.illinois.edu', env='cem_dev', use_incoming_socket=False)
 assert vis.check_connection()
 
 np.random.seed(2)
 torch.manual_seed(9)
 
-L = 10
+L = 2
 K = 4
 N = 2000
 cuda = torch.cuda.is_available()

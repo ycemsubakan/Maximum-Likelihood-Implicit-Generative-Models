@@ -12,7 +12,7 @@ class gmm():
         self.n_restarts = n_restarts
         self.cuda = cuda
 
-    def kmeans(self, X_all, vis):
+    def kmeans(self, X_all):
 
         L = X_all[0].size(1)
         eps = 1e-20
@@ -60,7 +60,7 @@ class gmm():
 
         # should I add kmeans with covariances? 
 
-    def em(self, X_all, em_iters): 
+    def em(self, X_all, em_iters=15): 
         L = X_all[0].size(1)
             
         eps = 1e-20
